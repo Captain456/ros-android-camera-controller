@@ -1,5 +1,6 @@
 package com.example.ros_android_camera_controller;
 
+import android.hardware.GeomagneticField;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -12,7 +13,7 @@ import org.ros.node.Node;
 import org.ros.node.NodeMain;
 import org.ros.node.topic.Publisher;
 
-import geometry_msgs.Quaternion;
+import std_msgs.Float32;
 
 public class OrientationPublisher implements NodeMain {
 
@@ -21,7 +22,12 @@ public class OrientationPublisher implements NodeMain {
     private SensorManager mSensorManager;
     private int mSensorDelay;
     private OrientationListenerThread mOrientationListenerThread;
-    private Publisher<Quaternion> mPublisher;
+    private Publisher<Float32> mPublisher;
+    private float[] gravity = new float[3];
+    private float[] geomagnetic = new float[3];
+    private float[] rotation = new float[9];
+    private float[] orientation = new float[3];
+    private float[] smoothened_values = new float[3];
 
     // Classes
     private class OrientationListenerThread extends Thread {
@@ -30,7 +36,8 @@ public class OrientationPublisher implements NodeMain {
         private final SensorManager mSensorManager;
         private OrientationEventListener mOrienationEventListener;
         private Looper mLooper;
-        private final Sensor mOrientationSensor;
+        private final Sensor mAccelerometerSensor;
+        private final Sensor mMagneticFieldSensor;
 
         // Constructors
         private OrientationListenerThread(
@@ -39,8 +46,10 @@ public class OrientationPublisher implements NodeMain {
             this.mSensorManager = sensorManager;
             this.mOrienationEventListener = orientationEventListener;
             // Set up to listen for orientation events
-            this.mOrientationSensor = this.mSensorManager
-                    .getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+            this.mAccelerometerSensor = this.mSensorManager
+                    .getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+            this.mMagneticFieldSensor = this.mSensorManager
+                    .getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
         }
 
         public void run() {
@@ -48,18 +57,27 @@ public class OrientationPublisher implements NodeMain {
             Looper.prepare();
             // myLooper() returns the current thread's Looper object
             this.mLooper = Looper.myLooper();
-            // Register the orientation listener
+            // Register the orientation listeners
             this.mSensorManager.registerListener(
                     this.mOrienationEventListener,
-                    this.mOrientationSensor,
+                    this.mAccelerometerSensor,
+                    mSensorDelay);
+            this.mSensorManager.registerListener(
+                    this.mOrienationEventListener,
+                    this.mMagneticFieldSensor,
                     mSensorDelay);
             // Loop to handle messages
             Looper.loop();
         }
 
         public void shutdown() {
-            // Unregister the orientation listener
-            this.mSensorManager.unregisterListener(this.mOrienationEventListener);
+            // Unregister the orientation listeners
+            this.mSensorManager.unregisterListener(
+                    this.mOrienationEventListener,
+                    this.mAccelerometerSensor);
+            this.mSensorManager.unregisterListener(
+                    this.mOrienationEventListener,
+                    this.mMagneticFieldSensor);
 
             // If the Looper has not been cleaned up, stop it
             if (this.mLooper != null) {
@@ -71,11 +89,14 @@ public class OrientationPublisher implements NodeMain {
     private class OrientationEventListener implements SensorEventListener {
 
         // Fields
-        private Publisher<Quaternion> mPublisher;
-        private float[] mOrientationQuaternion = new float[4];
+        private Publisher<Float32> mPublisher;
+        private float mBearingAngle = 0.0f;
+        private float mStartingAngle = 0.0f;
+        private int mEventCount = 0;
+        private boolean mHasStartingAngle = false;
 
         // Constructors
-        private OrientationEventListener(Publisher<Quaternion> publisher) {
+        private OrientationEventListener(Publisher<Float32> publisher) {
             this.mPublisher = publisher;
         }
 
@@ -87,28 +108,75 @@ public class OrientationPublisher implements NodeMain {
 
         @Override
         public void onSensorChanged(SensorEvent sensorEvent) {
-            if (sensorEvent.sensor.getType() == Sensor.TYPE_ROTATION_VECTOR)
-            {
-                // Get the quaternion from the SensorManager
-                SensorManager.getQuaternionFromVector(
-                        this.mOrientationQuaternion,
-                        sensorEvent.values);
+            boolean desiredSensor = false;
 
-                this.publishOrientationMessage();
+            if (sensorEvent.sensor.getType() == Sensor.TYPE_ACCELEROMETER)
+            {
+                // Smoothen the data via a low pass filter
+                smoothened_values = lowPassFilter(sensorEvent.values, gravity);
+
+                // Change the values of gravity to the smoothened values
+                for (int i = 0; i < gravity.length; i++) {
+                    gravity[i] = smoothened_values[i];
+                }
+
+                desiredSensor = true;
+            }
+            else if (sensorEvent.sensor.getType() == Sensor.TYPE_MAGNETIC_FIELD) {
+                // Smoothen the data via a low pass filter
+                smoothened_values = lowPassFilter(sensorEvent.values, geomagnetic);
+
+                // Change the values of geomagnetic to the smoothened values
+                for (int i = 0; i < geomagnetic.length; i++) {
+                    geomagnetic[i] = smoothened_values[i];
+                }
+
+                desiredSensor = true;
+            }
+
+            if (desiredSensor) {
+                // Get the rotation and orientation matrices
+                SensorManager.getRotationMatrix(rotation, null, gravity, geomagnetic);
+                SensorManager.getOrientation(rotation, orientation);
+
+                if (mEventCount == 20) {
+                    if (!mHasStartingAngle) {
+                        // We have received enough messages to be confident that the orientation is
+                        // now accurate. Set the starting angle.
+                        mStartingAngle = (float) Math.toDegrees(orientation[0]);
+                        mHasStartingAngle = true;
+                    }
+
+                    // May need to mess with which orientation index to use
+                    // UPDATE: This is the correct index
+                    mBearingAngle = (float) Math.toDegrees(orientation[0]) - mStartingAngle + 90;
+
+                    // Make sure that the bearing is between -90 and 270 degrees
+                    if (mBearingAngle < -90) {
+                        mBearingAngle += 360;
+                    }
+                    else if (mBearingAngle >= 270) {
+                        mBearingAngle -= 360;
+                    }
+
+                    // Publish the bearing angle in a ROS message
+                    this.publishOrientationMessage();
+                }
+                else {
+                    mEventCount++;
+                }
             }
         }
 
         // Private Methods
         private void publishOrientationMessage() {
             // Create a new message to publish
-            geometry_msgs.Quaternion message = this.mPublisher.newMessage();
+            std_msgs.Float32 message = this.mPublisher.newMessage();
 
-            // Set the quaternion values of the message
-            message.setW(this.mOrientationQuaternion[0]);
-            message.setX(this.mOrientationQuaternion[1]);
-            message.setY(this.mOrientationQuaternion[2]);
-            message.setZ(this.mOrientationQuaternion[3]);
+            // Set the value of the message to be the bearing angle
+            message.setData(mBearingAngle);
 
+            // Publish
             this.mPublisher.publish(message);
         }
     }
@@ -123,7 +191,7 @@ public class OrientationPublisher implements NodeMain {
     public void onStart(ConnectedNode node) {
         try {
             // Create the ROS publisher
-            this.mPublisher = node.newPublisher("orientation", "geometry_msgs/Quaternion");
+            this.mPublisher = node.newPublisher("orientation", "std_msgs/Float32");
 
             // Create the OrientationEventListener
             OrientationEventListener orientationEventListener =
@@ -174,4 +242,20 @@ public class OrientationPublisher implements NodeMain {
         return GraphName.of("camera_controller/orientationPublisher");
     }
 
+    // Protected Methods
+    protected float[] lowPassFilter(float[] in, float[] out)
+    {
+        float alpha = 0.25f;
+
+        if (out == null) {
+            return in;
+        }
+
+        // Apply the low pass filter
+        for (int i = 0; i < in.length; i++) {
+            out[i] = out[i] + alpha * (in[i] - out[i]);
+        }
+
+        return out;
+    }
 }
