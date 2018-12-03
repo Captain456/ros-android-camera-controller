@@ -2,6 +2,7 @@ package com.example.ros_android_camera_controller;
 
 import android.hardware.SensorManager;
 import android.os.Bundle;
+import android.view.WindowManager;
 
 import org.ros.address.InetAddressFactory;
 import org.ros.android.BitmapFromCompressedImage;
@@ -29,6 +30,7 @@ public class MainActivity extends RosActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         // Set up the sensor manager for the orientation data
         mSensorManager = (SensorManager)this.getSystemService(SENSOR_SERVICE);
